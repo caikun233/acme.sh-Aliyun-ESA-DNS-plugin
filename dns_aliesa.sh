@@ -1,336 +1,274 @@
-#!/usr/bin/env sh
+#!/usr/bin/bash
+# shellcheck disable=SC2034
+dns_aliesa_info='AlibabaCloud.com ESA
+Domains: Aliyun.com
+Site: AlibabaCloud.com
+Docs: https://www.alibabacloud.com/help/en/edge-security-acceleration
+Options:
+ AliESA_Key API Key
+ AliESA_Secret API Secret
+'
 
-# Aliyun ESA DNS API
-# This plugin uses Aliyun CLI (already configured with AccessKey)
-#
-# Usage:
-#   acme.sh --issue --dns dns_aliesa -d example.com -d *.example.com
-#
-# Note: Make sure aliyun CLI is installed and configured properly
+Ali_ESA_API="https://esa.ap-southeast-1.aliyuncs.com/"
 
-########  Public functions #####################
-
-#Usage: dns_aliesa_add _acme-challenge.www.domain.com "XKrxpRBosdIKFzxW_CT3KLZNf6q0HG9i01zxXp5CPBs"
+#Usage: dns_aliesa_add   _acme-challenge.www.domain.com   "XKrxpRBosdIKFzxW_CT3KLZNf6q0HG9i01zxXp5CPBs"
 dns_aliesa_add() {
   fulldomain=$1
   txtvalue=$2
-  
-  _info "Using Aliyun ESA DNS API"
-  _debug fulldomain "$fulldomain"
-  _debug txtvalue "$txtvalue"
-  
-  # Check if aliyun CLI is available
-  if ! _exists aliyun; then
-    _err "Aliyun CLI is not installed or not in PATH"
-    _err "Please install and configure aliyun CLI first"
+
+  _prepare_ali_credentials || return 1
+
+  _debug "First detect the site"
+  if ! _get_site "$fulldomain"; then
+    _err "Site not found for $fulldomain"
     return 1
   fi
-  
-  # Extract root domain from fulldomain
-  if ! _get_root "$fulldomain"; then
-    _err "Failed to detect root domain"
-    return 1
-  fi
-  
-  _info "Detected root domain: $_domain"
-  _debug "Sub domain: $_sub_domain"
-  
-  # Get Site ID for this domain
-  _info "Getting Site ID for domain: $_domain"
-  if ! _get_site_id "$_domain"; then
-    _err "Failed to get Site ID for domain: $_domain"
-    return 1
-  fi
-  
-  _info "Site ID: $_site_id"
-  
-  # Create TXT record
-  _info "Adding TXT record: $fulldomain"
-  if ! _add_txt_record "$fulldomain" "$txtvalue"; then
-    _err "Failed to add TXT record"
-    return 1
-  fi
-  
-  _info "TXT record added successfully. Record ID: $_record_id"
-  
-  # Save Record ID with domain-specific key for multi-domain support
-  # Replace invalid characters in variable name (-, .)
-  _record_key=$(echo "$fulldomain" | tr '.-' '_')
-  _savedomainconf "Ali_ESA_RecordId_$_record_key" "$_record_id"
-  
-  return 0
+
+  _debug "Add record"
+  _add_record_query "$_site_id" "$fulldomain" "$txtvalue" && _ali_rest "Add record" "" "POST"
 }
 
-#Usage: dns_aliesa_rm _acme-challenge.www.domain.com "XKrxpRBosdIKFzxW_CT3KLZNf6q0HG9i01zxXp5CPBs"
 dns_aliesa_rm() {
   fulldomain=$1
   txtvalue=$2
   
-  _info "Using Aliyun ESA DNS API"
-  _debug fulldomain "$fulldomain"
-  _debug txtvalue "$txtvalue"
+  _debug "Calling dns_aliesa_rm for domain: $fulldomain"
   
-  # Check if aliyun CLI is available
-  if ! _exists aliyun; then
-    _err "Aliyun CLI is not installed or not in PATH"
+  _prepare_ali_credentials || return 1
+
+  _debug "First detect the site"
+  if ! _get_site "$fulldomain"; then
+    _err "Site not found for $fulldomain"
     return 1
   fi
-  
-  # Get saved Record ID for this specific domain
-  # Replace invalid characters in variable name (-, .)
-  _record_key=$(echo "$fulldomain" | tr '.-' '_')
-  _record_id="$(_readdomainconf "Ali_ESA_RecordId_$_record_key")"
-  
-  if [ -z "$_record_id" ]; then
-    _err "No Record ID found for domain: $fulldomain"
-    _err "You may need to manually delete the record"
+
+  _clean_record
+}
+
+####################  Alibaba Cloud common functions below  ####################
+
+_prepare_ali_credentials() {
+  AliESA_Key="${AliESA_Key:-$(_readaccountconf_mutable AliESA_Key)}"
+  AliESA_Secret="${AliESA_Secret:-$(_readaccountconf_mutable AliESA_Secret)}"
+  if [ -z "$AliESA_Key" ] || [ -z "$AliESA_Secret" ]; then
+    AliESA_Key=""
+    AliESA_Secret=""
+    _err "You don't specify aliyun ESA api key and secret yet."
     return 1
   fi
+
+  #save the api key and secret to the account conf file.
+  _saveaccountconf_mutable AliESA_Key "$AliESA_Key"
+  _saveaccountconf_mutable AliESA_Secret "$AliESA_Secret"
+}
+
+# act ign mtd
+_ali_rest() {
+  act="$1"
+  ign="$2"
+  mtd="${3:-GET}"
+
+  signature=$(printf "%s" "$mtd&%2F&$(printf "%s" "$query" | _url_encode upper-hex)" | _hmac "sha1" "$(printf "%s" "$AliESA_Secret&" | _hex_dump | tr -d " ")" | _base64)
+  signature=$(printf "%s" "$signature" | _url_encode upper-hex)
+  url="$endpoint?Signature=$signature"
   
-  _info "Removing TXT record with Record ID: $_record_id"
-  if _delete_record "$_record_id"; then
-    _info "TXT record removed successfully"
-    # Clean up the saved Record ID
-    _cleardomainconf "Ali_ESA_RecordId_$_record_key"
-    return 0
+  _debug "Requesting $act..."
+
+  if [ "$mtd" = "GET" ]; then
+    url="$url&$query"
+    response="$(_get "$url")"
   else
-    _err "Failed to remove TXT record"
+    response="$(_post "$query" "$url" "" "$mtd" "application/x-www-form-urlencoded")"
+  fi
+
+  _ret="$?"
+  _debug2 response "$response"
+  
+  # Log raw response for debugging clean issues
+  _debug "$act response code: $_ret"
+  if [ "$act" = "List records" ] || [ "$act" = "List records retry" ]; then
+     _debug2 "$act raw response: $response"
+  fi
+
+  if [ "$_ret" != "0" ]; then
+    _err "Error <$act>"
     return 1
+  fi
+
+  if [ -z "$ign" ]; then
+    # ESA error structure might overlap with ALI DNS, checking for "Message" or "Code"
+    message="$(echo "$response" | _egrep_o "\"Message\":\"[^\"]*\"" | cut -d : -f 2 | tr -d \")"
+    if [ "$message" ]; then
+      _err "$message"
+      return 1
+    fi
   fi
 }
 
-####################  Private functions below ##################################
+_ali_nonce() {
+  if [ "$ACME_OPENSSL_BIN" ]; then
+    "$ACME_OPENSSL_BIN" rand -hex 16 2>/dev/null && return 0
+  fi
+  printf "%s" "$(date +%s)$$$(date +%N)" | _digest sha256 hex | cut -c 1-32
+}
 
-# Detect root domain and sub domain
-# Sets _domain and _sub_domain
-_get_root() {
+_ali_timestamp() {
+  date -u +"%Y-%m-%dT%H%%3A%M%%3A%SZ"
+}
+
+####################  Private functions below  ####################
+
+_get_site() {
   domain=$1
   i=1
   p=1
-  
-  # Get list of all sites from Aliyun ESA
-  _debug "Fetching all sites from Aliyun ESA"
-  
-  response=$(aliyun esa ListSites --PageSize 500 2>&1)
-  
-  if [ $? -ne 0 ]; then
-    _err "Failed to fetch sites list"
-    _debug "Response: $response"
-    return 1
-  fi
-  
-  _debug2 "ListSites response: $response"
-  
-  # Extract all site names from response
-  # Looking for "SiteName": "example.com"
-  site_names=$(echo "$response" | grep -o '"SiteName"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:[[:space:]]*"\(.*\)"/\1/')
-  
-  if [ -z "$site_names" ]; then
-    _err "No sites found in Aliyun ESA"
-    _err "Please add your domain to Aliyun ESA first"
-    return 1
-  fi
-  
-  _debug2 "Available sites: $site_names"
-  
-  # Try to match domain from right to left
-  # For example: _acme-challenge.esatest1.rusleep.net
-  # Will try: net, rusleep.net, esatest1.rusleep.net, _acme-challenge.esatest1.rusleep.net
-  
   while true; do
-    h=$(printf "%s" "$domain" | cut -d . -f $i-)
-    _debug "Checking if $h is a registered site"
-    
+    h=$(printf "%s" "$domain" | cut -d . -f "$i"-100)
     if [ -z "$h" ]; then
-      # No more parts to check
-      _err "Cannot find root domain in Aliyun ESA sites"
-      _err "Available sites: $site_names"
-      _err "Your domain: $domain"
+      #not valid
       return 1
     fi
-    
-    # Check if this h matches any site name
-    if _contains "$site_names" "$h"; then
-      _domain="$h"
-      
-      # Calculate sub_domain
-      if [ "$domain" = "$_domain" ]; then
-        _sub_domain=""
-      else
-        _sub_domain=$(printf "%s" "$domain" | cut -d . -f 1-$p)
-      fi
-      
-      _debug "Found root domain: $_domain"
-      _debug "Sub domain: $_sub_domain"
-      return 0
+
+    _list_sites_query "$h"
+    if ! _ali_rest "Get site" "ignore"; then
+      return 1
     fi
-    
-    p=$i
+
+    if _contains "$response" "\"TotalCount\""; then
+      count=$(echo "$response" | _egrep_o "\"TotalCount\":[0-9]+" | cut -d : -f 2)
+      if [ "$count" ] && [ "$count" -gt 0 ]; then
+          # Extract SiteId
+          _site_id=$(echo "$response" | _egrep_o "\"SiteId\":[0-9]+" | head -n 1 | cut -d : -f 2)
+          _debug _site_id "$_site_id"
+          return 0
+      fi
+    fi
+    p="$i"
     i=$(_math "$i" + 1)
   done
-  
   return 1
 }
 
-_get_site_id() {
-  domain=$1
-  
-  _debug "Querying Site ID for domain: $domain"
-  
-  # Call aliyun CLI to get site list
-  response=$(aliyun esa ListSites --SiteName "$domain" 2>&1)
-  
-  if [ $? -ne 0 ]; then
-    _err "Failed to call aliyun CLI"
-    _debug "Response: $response"
-    return 1
-  fi
-  
-  _debug2 "ListSites response: $response"
-  
-  # Extract Site ID using grep and sed
-  # Looking for "SiteId": 572217942623808
-  _site_id=$(echo "$response" | grep -o '"SiteId"[[:space:]]*:[[:space:]]*[0-9]*' | head -n 1 | sed 's/.*:[[:space:]]*//')
-  
-  if [ -z "$_site_id" ]; then
-    _err "Could not find Site ID in response"
-    _debug "Response: $response"
-    return 1
-  fi
-  
-  _debug "Found Site ID: $_site_id"
-  
-  # Cache the Site ID for this domain
-  _record_key=$(echo "$domain" | tr '.-' '_')
-  _savedomainconf "Ali_ESA_SiteId_$_record_key" "$_site_id"
-  
-  return 0
+# Sorted alphabetically by parameter name:
+# AccessKeyId, Action, Format, SignatureMethod, SignatureNonce, SignatureVersion, SiteName, SiteSearchType, Timestamp, Version
+_list_sites_query() {
+  endpoint=$Ali_ESA_API
+  query=''
+  query=$query'AccessKeyId='$AliESA_Key
+  query=$query'&Action=ListSites'
+  query=$query'&Format=json'
+  query=$query'&SignatureMethod=HMAC-SHA1'
+  query=$query"&SignatureNonce=$(_ali_nonce)"
+  query=$query'&SignatureVersion=1.0'
+  query=$query'&SiteName='$1
+  query=$query'&SiteSearchType=exact'
+  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Version=2024-09-10'
 }
 
-_add_txt_record() {
-  domain=$1
-  txtvalue=$2
+# Sorted alphabetically by parameter name:
+# AccessKeyId, Action, Data, Format, RecordName, SignatureMethod, SignatureNonce, SignatureVersion, SiteId, Timestamp, Ttl, Type, Version
+_add_record_query() {
+  endpoint=$Ali_ESA_API
+  query=''
+  query=$query'AccessKeyId='$AliESA_Key
+  query=$query'&Action=CreateRecord'
   
-  _debug "Creating TXT record for: $domain"
-  _debug "TXT value: $txtvalue"
+  # Data needs to be URL encoded if it contains special chars
+  # We construct it locally then encode
+  data_val="{\"value\":\"$3\"}"
+  data_enc=$(printf "%s" "$data_val" | _url_encode upper-hex) 
   
-  # Create the record using aliyun CLI
-  response=$(aliyun esa CreateRecord \
-    --SiteId "$_site_id" \
-    --RecordName "$domain" \
-    --Type TXT \
-    --Ttl 30 \
-    --Data "{\"Value\":\"$txtvalue\"}" 2>&1)
-  
-  if [ $? -ne 0 ]; then
-    _err "Failed to create TXT record"
-    _debug "Response: $response"
-    return 1
-  fi
-  
-  _debug2 "CreateRecord response: $response"
-  
-  # Extract Record ID
-  # Looking for "RecordId": 3865110073780544
-  _record_id=$(echo "$response" | grep -o '"RecordId"[[:space:]]*:[[:space:]]*[0-9]*' | head -n 1 | sed 's/.*:[[:space:]]*//')
-  
-  if [ -z "$_record_id" ]; then
-    _err "Could not find Record ID in response"
-    _debug "Response: $response"
-    return 1
-  fi
-  
-  _debug "Record created with ID: $_record_id"
-  
-  # Wait a moment for DNS propagation
-  _sleep 2
-  
-  # Verify the record was created correctly
-  if ! _verify_txt_record "$_record_id" "$txtvalue"; then
-    _err "Record verification failed"
-    return 1
-  fi
-  
-  return 0
+  query=$query'&Data='$data_enc
+  query=$query'&Format=json'
+  query=$query'&RecordName='$2
+  query=$query'&SignatureMethod=HMAC-SHA1'
+  query=$query"&SignatureNonce=$(_ali_nonce)"
+  query=$query'&SignatureVersion=1.0'
+  query=$query'&SiteId='$1
+  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Ttl=30'
+  query=$query'&Type=TXT'
+  query=$query'&Version=2024-09-10'
 }
 
-_verify_txt_record() {
-  record_id=$1
-  expected_value=$2
-  
-  _debug "Verifying TXT record: $record_id"
-  
-  response=$(aliyun esa GetRecord --RecordId "$record_id" 2>&1)
-  
-  if [ $? -ne 0 ]; then
-    _err "Failed to get record details"
-    _debug "Response: $response"
-    return 1
-  fi
-  
-  _debug2 "GetRecord response: $response"
-  
-  # Extract the Value from response
-  # Looking for "Value": "abcdef123456"
-  actual_value=$(echo "$response" | grep -o '"Value"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 | sed 's/.*:[[:space:]]*"\(.*\)"/\1/')
-  
-  _debug "Expected value: $expected_value"
-  _debug "Actual value: $actual_value"
-  
-  if [ "$actual_value" = "$expected_value" ]; then
-    _info "Record verified successfully"
-    return 0
-  else
-    _err "Record value mismatch"
-    return 1
-  fi
+# Sorted alphabetically by parameter name:
+# AccessKeyId, Action, Format, RecordId, SignatureMethod, SignatureNonce, SignatureVersion, Timestamp, Version
+_delete_record_query() {
+  endpoint=$Ali_ESA_API
+  query=''
+  query=$query'AccessKeyId='$AliESA_Key
+  query=$query'&Action=DeleteRecord'
+  query=$query'&Format=json'
+  query=$query'&RecordId='$1
+  query=$query'&SignatureMethod=HMAC-SHA1'
+  query=$query"&SignatureNonce=$(_ali_nonce)"
+  query=$query'&SignatureVersion=1.0'
+  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Version=2024-09-10'
 }
 
-_delete_record() {
-  record_id=$1
-  
-  _debug "Deleting record: $record_id"
-  
-  # Delete the record using aliyun CLI (only RecordId needed)
-  response=$(aliyun esa DeleteRecord --RecordId "$record_id" 2>&1)
-  
-  if [ $? -ne 0 ]; then
-    _err "Failed to delete record"
-    _debug "Response: $response"
-    return 1
-  fi
-  
-  _debug2 "DeleteRecord response: $response"
-  
-  # Check if RequestId exists in response (indicates success)
-  if echo "$response" | grep -q '"RequestId"'; then
-    _debug "Record deleted successfully"
-    return 0
-  else
-    _err "Unexpected response from DeleteRecord"
-    _debug "Response: $response"
-    return 1
-  fi
+# Sorted alphabetically by parameter name:
+# AccessKeyId, Action, Format, RecordName, SignatureMethod, SignatureNonce, SignatureVersion, SiteId, Timestamp, Type, Version
+_list_records_query() {
+  endpoint=$Ali_ESA_API
+  query=''
+  query=$query'AccessKeyId='$AliESA_Key
+  query=$query'&Action=ListRecords'
+  query=$query'&Format=json'
+  query=$query'&RecordName='$2
+  query=$query'&SignatureMethod=HMAC-SHA1'
+  query=$query"&SignatureNonce=$(_ali_nonce)"
+  query=$query'&SignatureVersion=1.0'
+  query=$query'&SiteId='$1
+  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Type=TXT'
+  query=$query'&Version=2024-09-10'
 }
 
-_sleep() {
-  secs=$1
-  _debug "Sleep $secs seconds"
-  sleep "$secs"
-}
-
-_exists() {
-  cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1
-}
-
-_contains() {
-  _str="$1"
-  _sub="$2"
-  echo "$_str" | grep -F -- "$_sub" >/dev/null 2>&1
-}
-
-_math() {
-  _m_opts="$@"
-  printf "%s" "$(($_m_opts))"
+_clean_record() {
+  _debug "Starting record cleanup for TXT value: $txtvalue"
+  # Retry loop to handle syncing delay
+  for i in 1 2 3; do
+    _debug "Clean check iteration $i"
+    _list_records_query "$_site_id" "$fulldomain"
+    if _ali_rest "List records" "ignore"; then
+      # Robust parsing:
+      # 1. Remove all spaces/newlines to handle varying formatting
+      clean_json=$(echo "$response" | tr -d '[:space:]')
+      
+      # 2. Split records by "},{" which is the standard object separator in JSON arrays
+      #    We replace "},{" with "}\n{" to put each record on a new line
+      #    This ensures we don't mix up RecordIds and Values from different records
+      records_list=$(echo "$clean_json" | sed 's/},{/}\n{/g')
+      
+      # 3. Find the line containing our specific TXT value
+      #    We must escape special chars in txtvalue if any, but acme challenge is usually safe
+      _debug "Searching for value in record list..."
+      # ESA API returns "Data":{"Value":"..."} (Capital V) in list response, even if we sent lowercase.
+      # Use grep -i to handle both "value" and "Value" keys
+      target_record=$(echo "$records_list" | grep -i "\"value\":\"$txtvalue\"")
+      
+      if [ "$target_record" ]; then
+         _debug "Record found: $target_record"
+         # 4. Extract RecordId from that specific line
+         rec_id=$(echo "$target_record" | _egrep_o "\"RecordId\":[0-9]+" | cut -d : -f 2)
+         
+         if [ "$rec_id" ]; then
+             _debug "Found existing record ID to delete: $rec_id"
+             _delete_record_query "$rec_id"
+             _ali_rest "Delete record $rec_id" "ignore" "POST"
+             return 0
+         else
+             _debug "Parsing RecordId failed from line."
+         fi
+      else
+         _debug "Target value not found in current record list."
+      fi
+    fi
+    _debug "Record not found for cleanup, retrying in 3s..."
+    _sleep 3
+  done
+  
+  _debug "Failed to find record to clean after retries. Manual cleanup may be required."
 }
