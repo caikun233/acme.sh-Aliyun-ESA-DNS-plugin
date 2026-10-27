@@ -1,20 +1,31 @@
-#!/usr/bin/bash
+#!/usr/bin/env sh
 # shellcheck disable=SC2034
 dns_aliesa_info='AlibabaCloud.com ESA
 Domains: Aliyun.com
 Site: AlibabaCloud.com
-Docs: https://www.alibabacloud.com/help/en/edge-security-acceleration
+Docs: github.com/acmesh-official/acme.sh/wiki/dnsapi2#dns_aliesa
 Options:
  AliESA_Key API Key
  AliESA_Secret API Secret
+ AliESA_Endpoint API Endpoint. Default "https://esa.ap-southeast-1.aliyuncs.com/". Optional.
+Issues: github.com/acmesh-official/acme.sh/issues/7357
+Author: @caikun233
 '
 
-Ali_ESA_API="https://esa.ap-southeast-1.aliyuncs.com/"
+Ali_ESA_API_DEFAULT="https://esa.ap-southeast-1.aliyuncs.com/"
 
 #Usage: dns_aliesa_add   _acme-challenge.www.domain.com   "XKrxpRBosdIKFzxW_CT3KLZNf6q0HG9i01zxXp5CPBs"
 dns_aliesa_add() {
-  fulldomain=$1
-  txtvalue=$2
+  #the API only accepts punycode for IDN domains, and a raw UTF-8 domain
+  #also breaks the request signature.
+  #the record name must be lower case, and DNS names are case-insensitive.
+  fulldomain="$(printf "%s" "$(_idn "$1")" | tr '[:upper:]' '[:lower:]')"
+  txtvalue="$2"
+
+  if [ -z "$fulldomain" ]; then
+    _err "Cannot convert the domain to punycode: $1"
+    return 1
+  fi
 
   _prepare_ali_credentials || return 1
 
@@ -29,11 +40,16 @@ dns_aliesa_add() {
 }
 
 dns_aliesa_rm() {
-  fulldomain=$1
-  txtvalue=$2
-  
+  fulldomain="$(printf "%s" "$(_idn "$1")" | tr '[:upper:]' '[:lower:]')"
+
+  if [ -z "$fulldomain" ]; then
+    _err "Cannot convert the domain to punycode: $1"
+    return 1
+  fi
+  txtvalue="$2"
+
   _debug "Calling dns_aliesa_rm for domain: $fulldomain"
-  
+
   _prepare_ali_credentials || return 1
 
   _debug "First detect the site"
@@ -50,6 +66,7 @@ dns_aliesa_rm() {
 _prepare_ali_credentials() {
   AliESA_Key="${AliESA_Key:-$(_readaccountconf_mutable AliESA_Key)}"
   AliESA_Secret="${AliESA_Secret:-$(_readaccountconf_mutable AliESA_Secret)}"
+  AliESA_Endpoint="${AliESA_Endpoint:-$(_readaccountconf_mutable AliESA_Endpoint)}"
   if [ -z "$AliESA_Key" ] || [ -z "$AliESA_Secret" ]; then
     AliESA_Key=""
     AliESA_Secret=""
@@ -57,9 +74,21 @@ _prepare_ali_credentials() {
     return 1
   fi
 
+  if [ -z "$AliESA_Endpoint" ]; then
+    AliESA_Endpoint="$Ali_ESA_API_DEFAULT"
+  fi
+  #the endpoint is used as "$endpoint?Signature=...", so it must end with "/"
+  case "$AliESA_Endpoint" in
+  */) ;;
+  *) AliESA_Endpoint="$AliESA_Endpoint/" ;;
+  esac
+  Ali_ESA_API="$AliESA_Endpoint"
+
   #save the api key and secret to the account conf file.
   _saveaccountconf_mutable AliESA_Key "$AliESA_Key"
   _saveaccountconf_mutable AliESA_Secret "$AliESA_Secret"
+  _saveaccountconf_mutable AliESA_Endpoint "$AliESA_Endpoint"
+  return 0
 }
 
 # act ign mtd
@@ -71,7 +100,7 @@ _ali_rest() {
   signature=$(printf "%s" "$mtd&%2F&$(printf "%s" "$query" | _url_encode upper-hex)" | _hmac "sha1" "$(printf "%s" "$AliESA_Secret&" | _hex_dump | tr -d " ")" | _base64)
   signature=$(printf "%s" "$signature" | _url_encode upper-hex)
   url="$endpoint?Signature=$signature"
-  
+
   _debug "Requesting $act..."
 
   if [ "$mtd" = "GET" ]; then
@@ -83,12 +112,6 @@ _ali_rest() {
 
   _ret="$?"
   _debug2 response "$response"
-  
-  # Log raw response for debugging clean issues
-  _debug "$act response code: $_ret"
-  if [ "$act" = "List records" ] || [ "$act" = "List records retry" ]; then
-     _debug2 "$act raw response: $response"
-  fi
 
   if [ "$_ret" != "0" ]; then
     _err "Error <$act>"
@@ -121,9 +144,8 @@ _ali_timestamp() {
 _get_site() {
   domain=$1
   i=1
-  p=1
   while true; do
-    h=$(printf "%s" "$domain" | cut -d . -f "$i"-100)
+    h="$(printf "%s" "$domain" | cut -d . -f "$i"-100)"
     if [ -z "$h" ]; then
       #not valid
       return 1
@@ -135,15 +157,14 @@ _get_site() {
     fi
 
     if _contains "$response" "\"TotalCount\""; then
-      count=$(echo "$response" | _egrep_o "\"TotalCount\":[0-9]+" | cut -d : -f 2)
+      count="$(printf "%s" "$response" | _egrep_o "\"TotalCount\":[0-9]+" | cut -d : -f 2)"
       if [ "$count" ] && [ "$count" -gt 0 ]; then
-          # Extract SiteId
-          _site_id=$(echo "$response" | _egrep_o "\"SiteId\":[0-9]+" | head -n 1 | cut -d : -f 2)
-          _debug _site_id "$_site_id"
-          return 0
+        #extract the SiteId
+        _site_id="$(printf "%s" "$response" | _egrep_o "\"SiteId\":[0-9]+" | _head_n 1 | cut -d : -f 2)"
+        _debug _site_id "$_site_id"
+        return 0
       fi
     fi
-    p="$i"
     i=$(_math "$i" + 1)
   done
   return 1
@@ -173,12 +194,12 @@ _add_record_query() {
   query=''
   query=$query'AccessKeyId='$AliESA_Key
   query=$query'&Action=CreateRecord'
-  
+
   # Data needs to be URL encoded if it contains special chars
   # We construct it locally then encode
   data_val="{\"value\":\"$3\"}"
-  data_enc=$(printf "%s" "$data_val" | _url_encode upper-hex) 
-  
+  data_enc=$(printf "%s" "$data_val" | _url_encode upper-hex)
+
   query=$query'&Data='$data_enc
   query=$query'&Format=json'
   query=$query'&RecordName='$2
@@ -229,46 +250,57 @@ _list_records_query() {
 _clean_record() {
   _debug "Starting record cleanup for TXT value: $txtvalue"
   # Retry loop to handle syncing delay
-  for i in 1 2 3; do
+  i=1
+  while [ "$i" -le 3 ]; do
     _debug "Clean check iteration $i"
     _list_records_query "$_site_id" "$fulldomain"
     if _ali_rest "List records" "ignore"; then
       # Robust parsing:
       # 1. Remove all spaces/newlines to handle varying formatting
-      clean_json=$(echo "$response" | tr -d '[:space:]')
-      
-      # 2. Split records by "},{" which is the standard object separator in JSON arrays
-      #    We replace "},{" with "}\n{" to put each record on a new line
-      #    This ensures we don't mix up RecordIds and Values from different records
-      records_list=$(echo "$clean_json" | sed 's/},{/}\n{/g')
-      
-      # 3. Find the line containing our specific TXT value
-      #    We must escape special chars in txtvalue if any, but acme challenge is usually safe
+      clean_json="$(printf "%s" "$response" | tr -d '[:space:]')"
+
+      # 2. Put every record on its own line: in a JSON array of objects the
+      #    separator is "},{", so each RecordId stays next to its Value.
+      #    A "\n" in a sed replacement is a GNU extension that BSD and busybox
+      #    sed print literally, so use an escaped newline instead.
+      records_list="$(printf "%s" "$clean_json" | sed 's/},{/},\
+{/g')"
+
+      # 3. Find the line containing our TXT value ("-F": match it literally)
       _debug "Searching for value in record list..."
       # ESA API returns "Data":{"Value":"..."} (Capital V) in list response, even if we sent lowercase.
       # Use grep -i to handle both "value" and "Value" keys
-      target_record=$(echo "$records_list" | grep -i "\"value\":\"$txtvalue\"")
-      
+      target_record="$(printf "%s" "$records_list" | grep -i -F -- "\"value\":\"$txtvalue\"" | _head_n 1)"
+
       if [ "$target_record" ]; then
-         _debug "Record found: $target_record"
-         # 4. Extract RecordId from that specific line
-         rec_id=$(echo "$target_record" | _egrep_o "\"RecordId\":[0-9]+" | cut -d : -f 2)
-         
-         if [ "$rec_id" ]; then
-             _debug "Found existing record ID to delete: $rec_id"
-             _delete_record_query "$rec_id"
-             _ali_rest "Delete record $rec_id" "ignore" "POST"
-             return 0
-         else
-             _debug "Parsing RecordId failed from line."
-         fi
+        _debug "Record found: $target_record"
+        # 4. Extract RecordId from that specific line
+        rec_id="$(printf "%s" "$target_record" | _egrep_o "\"RecordId\":[0-9]+" | cut -d : -f 2 | tr -d '\"')"
+
+        if [ "$rec_id" ]; then
+          _debug "Found existing record ID to delete: $rec_id"
+          _delete_record_query "$rec_id"
+          if ! _ali_rest "Delete record $rec_id" "ignore" "POST"; then
+            _err "Failed to delete the TXT record: $rec_id"
+            return 1
+          fi
+          _debug "Deleted record $rec_id"
+          return 0
+        else
+          _debug "Parsing RecordId failed from line."
+        fi
       else
-         _debug "Target value not found in current record list."
+        _debug "Target value not found in current record list."
       fi
     fi
-    _debug "Record not found for cleanup, retrying in 3s..."
-    _sleep 3
+    i=$(_math "$i" + 1)
+    if [ "$i" -le 3 ]; then
+      _debug "Record not found yet, retrying in 3s..."
+      _sleep 3
+    fi
   done
-  
-  _debug "Failed to find record to clean after retries. Manual cleanup may be required."
+
+  #the record may already be gone, which is not an error for the rm hook
+  _debug "Record not found, nothing to clean."
+  return 0
 }
