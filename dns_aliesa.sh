@@ -19,7 +19,7 @@ dns_aliesa_add() {
   #the API only accepts punycode for IDN domains, and a raw UTF-8 domain
   #also breaks the request signature.
   #the record name must be lower case, and DNS names are case-insensitive.
-  fulldomain="$(printf "%s" "$(_idn "$1")" | tr '[:upper:]' '[:lower:]')"
+  fulldomain="$(_idn "$1" | _lower_case)"
   txtvalue="$2"
 
   if [ -z "$fulldomain" ]; then
@@ -27,20 +27,20 @@ dns_aliesa_add() {
     return 1
   fi
 
-  _prepare_ali_credentials || return 1
+  _aliesa_prepare_credentials || return 1
 
   _debug "First detect the site"
-  if ! _get_site "$fulldomain"; then
+  if ! _aliesa_get_site "$fulldomain"; then
     _err "Site not found for $fulldomain"
     return 1
   fi
 
   _debug "Add record"
-  _add_record_query "$_site_id" "$fulldomain" "$txtvalue" && _ali_rest "Add record" "" "POST"
+  _aliesa_add_record_query "$_site_id" "$fulldomain" "$txtvalue" && _aliesa_rest "Add record" "" "POST"
 }
 
 dns_aliesa_rm() {
-  fulldomain="$(printf "%s" "$(_idn "$1")" | tr '[:upper:]' '[:lower:]')"
+  fulldomain="$(_idn "$1" | _lower_case)"
 
   if [ -z "$fulldomain" ]; then
     _err "Cannot convert the domain to punycode: $1"
@@ -50,20 +50,20 @@ dns_aliesa_rm() {
 
   _debug "Calling dns_aliesa_rm for domain: $fulldomain"
 
-  _prepare_ali_credentials || return 1
+  _aliesa_prepare_credentials || return 1
 
   _debug "First detect the site"
-  if ! _get_site "$fulldomain"; then
+  if ! _aliesa_get_site "$fulldomain"; then
     _err "Site not found for $fulldomain"
     return 1
   fi
 
-  _clean_record
+  _aliesa_clean_record
 }
 
 ####################  Alibaba Cloud common functions below  ####################
 
-_prepare_ali_credentials() {
+_aliesa_prepare_credentials() {
   AliESA_Key="${AliESA_Key:-$(_readaccountconf_mutable AliESA_Key)}"
   AliESA_Secret="${AliESA_Secret:-$(_readaccountconf_mutable AliESA_Secret)}"
   AliESA_Endpoint="${AliESA_Endpoint:-$(_readaccountconf_mutable AliESA_Endpoint)}"
@@ -92,7 +92,7 @@ _prepare_ali_credentials() {
 }
 
 # act ign mtd
-_ali_rest() {
+_aliesa_rest() {
   act="$1"
   ign="$2"
   mtd="${3:-GET}"
@@ -128,20 +128,20 @@ _ali_rest() {
   fi
 }
 
-_ali_nonce() {
-  if [ "$ACME_OPENSSL_BIN" ]; then
-    "$ACME_OPENSSL_BIN" rand -hex 16 2>/dev/null && return 0
-  fi
-  printf "%s" "$(date +%s)$$$(date +%N)" | _digest sha256 hex | cut -c 1-32
+# SignatureNonce must be unique for every request. Derive it from core helpers
+# only: time, pid, a per-process counter and a per-request hint.
+_aliesa_nonce() {
+  _aliesa_nonce_seq=$(_math "${_aliesa_nonce_seq:-0}" + 1)
+  _aliesa_nonce_value="$(printf "%s" "$(_time)${_aliesa_nonce_seq}$$$1" | _digest sha256 hex | cut -c 1-32)"
 }
 
-_ali_timestamp() {
+_aliesa_timestamp() {
   date -u +"%Y-%m-%dT%H%%3A%M%%3A%SZ"
 }
 
 ####################  Private functions below  ####################
 
-_get_site() {
+_aliesa_get_site() {
   domain=$1
   i=1
   while true; do
@@ -151,8 +151,8 @@ _get_site() {
       return 1
     fi
 
-    _list_sites_query "$h"
-    if ! _ali_rest "Get site" "ignore"; then
+    _aliesa_list_sites_query "$h"
+    if ! _aliesa_rest "Get site" "ignore"; then
       return 1
     fi
 
@@ -172,24 +172,25 @@ _get_site() {
 
 # Sorted alphabetically by parameter name:
 # AccessKeyId, Action, Format, SignatureMethod, SignatureNonce, SignatureVersion, SiteName, SiteSearchType, Timestamp, Version
-_list_sites_query() {
+_aliesa_list_sites_query() {
   endpoint=$Ali_ESA_API
   query=''
   query=$query'AccessKeyId='$AliESA_Key
   query=$query'&Action=ListSites'
   query=$query'&Format=json'
   query=$query'&SignatureMethod=HMAC-SHA1'
-  query=$query"&SignatureNonce=$(_ali_nonce)"
+  _aliesa_nonce "ListSites:$1"
+  query=$query"&SignatureNonce=$_aliesa_nonce_value"
   query=$query'&SignatureVersion=1.0'
   query=$query'&SiteName='$1
   query=$query'&SiteSearchType=exact'
-  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Timestamp='$(_aliesa_timestamp)
   query=$query'&Version=2024-09-10'
 }
 
 # Sorted alphabetically by parameter name:
 # AccessKeyId, Action, Data, Format, RecordName, SignatureMethod, SignatureNonce, SignatureVersion, SiteId, Timestamp, Ttl, Type, Version
-_add_record_query() {
+_aliesa_add_record_query() {
   endpoint=$Ali_ESA_API
   query=''
   query=$query'AccessKeyId='$AliESA_Key
@@ -204,10 +205,11 @@ _add_record_query() {
   query=$query'&Format=json'
   query=$query'&RecordName='$2
   query=$query'&SignatureMethod=HMAC-SHA1'
-  query=$query"&SignatureNonce=$(_ali_nonce)"
+  _aliesa_nonce "CreateRecord:$1:$2:$3"
+  query=$query"&SignatureNonce=$_aliesa_nonce_value"
   query=$query'&SignatureVersion=1.0'
   query=$query'&SiteId='$1
-  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Timestamp='$(_aliesa_timestamp)
   query=$query'&Ttl=30'
   query=$query'&Type=TXT'
   query=$query'&Version=2024-09-10'
@@ -215,7 +217,7 @@ _add_record_query() {
 
 # Sorted alphabetically by parameter name:
 # AccessKeyId, Action, Format, RecordId, SignatureMethod, SignatureNonce, SignatureVersion, Timestamp, Version
-_delete_record_query() {
+_aliesa_delete_record_query() {
   endpoint=$Ali_ESA_API
   query=''
   query=$query'AccessKeyId='$AliESA_Key
@@ -223,15 +225,16 @@ _delete_record_query() {
   query=$query'&Format=json'
   query=$query'&RecordId='$1
   query=$query'&SignatureMethod=HMAC-SHA1'
-  query=$query"&SignatureNonce=$(_ali_nonce)"
+  _aliesa_nonce "DeleteRecord:$1"
+  query=$query"&SignatureNonce=$_aliesa_nonce_value"
   query=$query'&SignatureVersion=1.0'
-  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Timestamp='$(_aliesa_timestamp)
   query=$query'&Version=2024-09-10'
 }
 
 # Sorted alphabetically by parameter name:
 # AccessKeyId, Action, Format, RecordName, SignatureMethod, SignatureNonce, SignatureVersion, SiteId, Timestamp, Type, Version
-_list_records_query() {
+_aliesa_list_records_query() {
   endpoint=$Ali_ESA_API
   query=''
   query=$query'AccessKeyId='$AliESA_Key
@@ -239,48 +242,61 @@ _list_records_query() {
   query=$query'&Format=json'
   query=$query'&RecordName='$2
   query=$query'&SignatureMethod=HMAC-SHA1'
-  query=$query"&SignatureNonce=$(_ali_nonce)"
+  _aliesa_nonce "ListRecords:$1:$2"
+  query=$query"&SignatureNonce=$_aliesa_nonce_value"
   query=$query'&SignatureVersion=1.0'
   query=$query'&SiteId='$1
-  query=$query'&Timestamp='$(_ali_timestamp)
+  query=$query'&Timestamp='$(_aliesa_timestamp)
   query=$query'&Type=TXT'
   query=$query'&Version=2024-09-10'
 }
 
-_clean_record() {
+_aliesa_clean_record() {
   _debug "Starting record cleanup for TXT value: $txtvalue"
   # Retry loop to handle syncing delay
   i=1
   while [ "$i" -le 3 ]; do
     _debug "Clean check iteration $i"
-    _list_records_query "$_site_id" "$fulldomain"
-    if _ali_rest "List records" "ignore"; then
-      # Robust parsing:
-      # 1. Remove all spaces/newlines to handle varying formatting
-      clean_json="$(printf "%s" "$response" | tr -d '[:space:]')"
+    _aliesa_list_records_query "$_site_id" "$fulldomain"
+    if _aliesa_rest "List records" "ignore"; then
+      # 1. Drop the line breaks and the spaces around ":" so every record fits
+      #    on one line and the value can be matched literally.
+      clean_json="$(printf "%s" "$response" | _normalizeJson)"
 
-      # 2. Put every record on its own line: in a JSON array of objects the
-      #    separator is "},{", so each RecordId stays next to its Value.
+      # 2. Split the Records array: the separator between two objects is
+      #    "},{" (or "}, {" before _normalizeJson ran), so each RecordId stays
+      #    next to its Value.
       #    A "\n" in a sed replacement is a GNU extension that BSD and busybox
       #    sed print literally, so use an escaped newline instead.
-      records_list="$(printf "%s" "$clean_json" | sed 's/},{/},\
+      #    echo terminates the last line, which Oracle Solaris sed would drop.
+      records_list="$(echo "$clean_json" | sed 's/},[ ]*{/},\
 {/g')"
 
-      # 3. Find the line containing our TXT value ("-F": match it literally)
+      # 3. Find the record whose value matches ours. Solaris /usr/bin/grep has
+      #    no -F, so match the value with a quoted case pattern instead.
       _debug "Searching for value in record list..."
-      # ESA API returns "Data":{"Value":"..."} (Capital V) in list response, even if we sent lowercase.
-      # Use grep -i to handle both "value" and "Value" keys
-      target_record="$(printf "%s" "$records_list" | grep -i -F -- "\"value\":\"$txtvalue\"" | _head_n 1)"
+      # ESA returns "Data":{"Value":"..."} in list responses, even if we sent lowercase.
+      _aliesa_target=''
+      while IFS= read -r _aliesa_line; do
+        case "$_aliesa_line" in
+        *"\"Value\":\"$txtvalue\""* | *"\"value\":\"$txtvalue\""*)
+          _aliesa_target="$_aliesa_line"
+          break
+          ;;
+        esac
+      done <<EOF
+$records_list
+EOF
 
-      if [ "$target_record" ]; then
-        _debug "Record found: $target_record"
+      if [ "$_aliesa_target" ]; then
+        _debug "Record found: $_aliesa_target"
         # 4. Extract RecordId from that specific line
-        rec_id="$(printf "%s" "$target_record" | _egrep_o "\"RecordId\":[0-9]+" | cut -d : -f 2 | tr -d '\"')"
+        rec_id="$(printf "%s" "$_aliesa_target" | _egrep_o "\"RecordId\": *[0-9]+" | cut -d : -f 2 | tr -d ' \"')"
 
         if [ "$rec_id" ]; then
           _debug "Found existing record ID to delete: $rec_id"
-          _delete_record_query "$rec_id"
-          if ! _ali_rest "Delete record $rec_id" "ignore" "POST"; then
+          _aliesa_delete_record_query "$rec_id"
+          if ! _aliesa_rest "Delete record $rec_id" "" "POST"; then
             _err "Failed to delete the TXT record: $rec_id"
             return 1
           fi
